@@ -20,7 +20,9 @@ from Crypto.Cipher import AES
 from Crypto.Util.Padding import unpad
 
 
-def _evp_bytes_to_key(password: bytes, salt: bytes, key_len: int = 32, iv_len: int = 16) -> tuple[bytes, bytes]:
+def _evp_bytes_to_key(
+    password: bytes, salt: bytes, key_len: int = 32, iv_len: int = 16
+) -> tuple[bytes, bytes]:
     """OpenSSL EVP_BytesToKey with MD5 — what CryptoJS uses by default."""
 
     out = b""

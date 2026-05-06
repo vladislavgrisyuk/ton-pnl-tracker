@@ -61,6 +61,8 @@ class Settings(BaseSettings):
 
     cache_ttl_seconds: int = 300
     max_events_per_wallet: int = 1000
+    tonapi_rps: float = 2.0
+    tonapi_event_batch_size: int = 30
     request_timeout_seconds: float = 30.0
 
     cors_origins: list[str] = [

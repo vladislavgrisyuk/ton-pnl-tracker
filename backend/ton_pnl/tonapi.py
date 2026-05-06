@@ -15,6 +15,8 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import time
+from collections import deque
 from typing import Any
 
 import httpx
@@ -43,10 +45,16 @@ class TonApiClient:
         timeout: float | None = None,
         extra_headers: dict[str, str] | None = None,
         extra_cookies: dict[str, str] | None = None,
+        rps: float | None = None,
     ) -> None:
         self._base_url = (base_url or settings.tonapi_base_url).rstrip("/")
         self._token = token if token is not None else settings.tonapi_token
         self._timeout = timeout or settings.request_timeout_seconds
+        self._rps = rps if rps is not None else settings.tonapi_rps
+        self._window_seconds = 1.0 if self._rps >= 1 else 1 / self._rps if self._rps > 0 else 0
+        self._max_requests_per_window = int(self._rps) if self._rps >= 1 else 1
+        self._request_times: deque[float] = deque()
+        self._rate_lock = asyncio.Lock()
         # Build the header set: a permissive Accept first, then operator-supplied
         # overrides (browser fingerprint when proxying through tonviewer), then
         # the bearer token last so it always wins over a stray Authorization.
@@ -69,6 +77,21 @@ class TonApiClient:
         # ``TON_PNL_TONVIEWER_PASSPHRASE`` lets operators override the key.
         self._tonviewer_mode = "tonviewer.com" in self._base_url
         self._tonviewer_passphrase = settings.tonviewer_passphrase
+
+    async def _throttle(self) -> None:
+        if self._rps <= 0:
+            return
+        while True:
+            async with self._rate_lock:
+                now = time.monotonic()
+                cutoff = now - self._window_seconds
+                while self._request_times and self._request_times[0] <= cutoff:
+                    self._request_times.popleft()
+                if len(self._request_times) < self._max_requests_per_window:
+                    self._request_times.append(now)
+                    return
+                wait_for = self._window_seconds - (now - self._request_times[0])
+            await asyncio.sleep(max(wait_for, 0.001))
 
     async def aclose(self) -> None:
         await self._client.aclose()
@@ -98,6 +121,7 @@ class TonApiClient:
         backoff = 0.5
         for attempt in range(5):
             try:
+                await self._throttle()
                 resp = await self._client.get(path, params=params)
             except httpx.RequestError as exc:
                 if attempt == 4:
@@ -125,29 +149,41 @@ class TonApiClient:
         self,
         address: str,
         *,
-        limit: int = 100,
+        limit: int | None = None,
         max_events: int | None = None,
     ) -> list[dict[str, Any]]:
         """Fetch up to ``max_events`` events for the account, paginating with before_lt."""
 
         cap = max_events if max_events is not None else settings.max_events_per_wallet
+        page_size = limit or settings.tonapi_event_batch_size
         events: list[dict[str, Any]] = []
         before_lt: int | None = None
         while len(events) < cap:
-            params: dict[str, Any] = {"limit": min(limit, cap - len(events))}
-            if before_lt is not None:
-                params["before_lt"] = before_lt
-            page = await self._get(f"/v2/accounts/{address}/events", params=params)
-            page_events = page.get("events") or []
+            page_events, next_from = await self.get_events_page(
+                address,
+                limit=min(page_size, cap - len(events)),
+                before_lt=before_lt,
+            )
             if not page_events:
                 break
             events.extend(page_events)
-            next_from = page.get("next_from")
-            # Stop when the API signals the end of history (next_from == 0 in practice).
             if not next_from or next_from == 0:
                 break
             before_lt = next_from
         return events[:cap]
+
+    async def get_events_page(
+        self,
+        address: str,
+        *,
+        limit: int,
+        before_lt: int | None = None,
+    ) -> tuple[list[dict[str, Any]], int | None]:
+        params: dict[str, Any] = {"limit": limit, "sort_order": "desc"}
+        if before_lt is not None:
+            params["before_lt"] = before_lt
+        page = await self._get(f"/v2/accounts/{address}/events", params=params)
+        return page.get("events") or [], page.get("next_from")
 
     async def get_jetton_balances(self, address: str) -> list[dict[str, Any]]:
         data = await self._get(f"/v2/accounts/{address}/jettons")

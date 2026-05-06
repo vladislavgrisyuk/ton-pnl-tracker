@@ -66,7 +66,89 @@ a {
   font-size: 13px;
 }
 
+.wallet-form__input--secondary {
+  flex: 1 1 240px;
+}
+
+.mode-tabs {
+  display: flex;
+  gap: 4px;
+  border-bottom: 1px solid var(--border-soft);
+  margin: 0 0 16px;
+}
+
+.mode-tab {
+  background: transparent;
+  border: none;
+  color: var(--text-soft);
+  padding: 10px 18px;
+  cursor: pointer;
+  border-radius: 0;
+  font-size: 14px;
+  border-bottom: 2px solid transparent;
+  font-weight: 500;
+}
+
+.mode-tab--active {
+  color: var(--text);
+  border-bottom-color: var(--accent-strong);
+}
+
+.token-progress {
+  background: var(--bg-elev);
+  border: 1px solid var(--border-soft);
+  border-radius: 8px;
+  padding: 14px 16px;
+  margin-bottom: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.token-progress__row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.token-progress__stats {
+  display: flex;
+  gap: 16px;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-soft);
+  font-size: 13px;
+}
+
+.mono {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+}
+
 .wallet-form__input:focus {
+  outline: 2px solid var(--accent-strong);
+  outline-offset: -2px;
+  border-color: var(--accent-strong);
+}
+
+.wallet-form__field {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--text-soft);
+  font-size: 12px;
+}
+
+.wallet-form__number {
+  width: 80px;
+  background: var(--bg-elev);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 10px 10px;
+  font-size: 13px;
+}
+
+.wallet-form__number:focus {
   outline: 2px solid var(--accent-strong);
   outline-offset: -2px;
   border-color: var(--accent-strong);
@@ -339,6 +421,32 @@ a {
   text-transform: uppercase;
   letter-spacing: 0.06em;
   color: var(--text-soft);
+}
+
+.badge--warn {
+  background: rgba(210, 153, 34, 0.15);
+  border-color: rgba(210, 153, 34, 0.45);
+  color: #f5d472;
+  margin-right: 4px;
+}
+
+.badge--queued,
+.badge--running {
+  background: rgba(88, 166, 255, 0.15);
+  border-color: rgba(88, 166, 255, 0.45);
+  color: var(--accent);
+}
+
+.badge--completed {
+  background: rgba(63, 185, 80, 0.15);
+  border-color: rgba(63, 185, 80, 0.45);
+  color: var(--positive);
+}
+
+.badge--failed {
+  background: rgba(248, 81, 73, 0.15);
+  border-color: rgba(248, 81, 73, 0.45);
+  color: var(--negative);
 }
 
 .empty {

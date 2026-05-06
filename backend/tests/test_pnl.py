@@ -233,3 +233,213 @@ def test_extract_swaps_skips_zero_amount_actions() -> None:
         }
     ]
     assert extract_swaps(events, wallet_address=wallet) == []
+
+
+def test_extract_swaps_collapses_pton_to_ton() -> None:
+    wallet = "0:1111111111111111111111111111111111111111111111111111111111111111"
+    events = [
+        {
+            "event_id": "e1",
+            "timestamp": 100,
+            "actions": [
+                {
+                    "type": "JettonSwap",
+                    "status": "ok",
+                    "JettonSwap": {
+                        "dex": "stonfi",
+                        "amount_in": "1000000000",
+                        "amount_out": "2000000000",
+                        "user_wallet": {"address": wallet},
+                        "jetton_master_in": {
+                            "address": JETTON_ADDR,
+                            "name": "Foo",
+                            "symbol": "FOO",
+                            "decimals": 9,
+                        },
+                        "jetton_master_out": {
+                            "address": "EQCM3B12QK1e4yZSf8GtBRT0aLMNyEsBc_DhVfRRtOEffLez",
+                            "name": "Proxy TON",
+                            "symbol": "pTON",
+                            "decimals": 9,
+                        },
+                    },
+                }
+            ],
+        }
+    ]
+    swaps = extract_swaps(events, wallet_address=wallet)
+    assert len(swaps) == 1
+    assert swaps[0].asset_in.asset_id == JETTON_ADDR
+    assert swaps[0].asset_out.asset_id == TON_ASSET_ID
+    assert math.isclose(swaps[0].ton_out or 0, 2.0)
+
+
+def test_extract_swaps_converts_flawed_transfer_buy() -> None:
+    wallet = "0:1111111111111111111111111111111111111111111111111111111111111111"
+    events = [
+        {
+            "event_id": "e1",
+            "timestamp": 100,
+            "actions": [
+                {
+                    "type": "SmartContractExec",
+                    "status": "ok",
+                    "SmartContractExec": {
+                        "executor": {"address": wallet},
+                        "contract": {
+                            "address": "0:2222222222222222222222222222222222222222222222222222222222222222"
+                        },
+                        "ton_attached": 5_200_000_000,
+                    },
+                },
+                {
+                    "type": "FlawedJettonTransfer",
+                    "status": "ok",
+                    "FlawedJettonTransfer": {
+                        "recipient": {"address": wallet},
+                        "received_amount": "38062985940916",
+                        "jetton": {
+                            "address": JETTON_ADDR,
+                            "name": "Foo",
+                            "symbol": "FOO",
+                            "decimals": 9,
+                        },
+                    },
+                },
+            ],
+        }
+    ]
+    swaps = extract_swaps(events, wallet_address=wallet)
+    assert len(swaps) == 1
+    assert swaps[0].asset_in.asset_id == TON_ASSET_ID
+    assert swaps[0].asset_out.asset_id == JETTON_ADDR
+    assert math.isclose(swaps[0].amount_in, 5.2)
+    assert math.isclose(swaps[0].amount_out, 38062.985940916)
+
+
+def test_extract_swaps_converts_plain_transfer_buy_and_sell() -> None:
+    wallet = "0:1111111111111111111111111111111111111111111111111111111111111111"
+    contract = "0:2222222222222222222222222222222222222222222222222222222222222222"
+    events = [
+        {
+            "event_id": "buy",
+            "timestamp": 100,
+            "actions": [
+                {
+                    "type": "SmartContractExec",
+                    "status": "ok",
+                    "SmartContractExec": {
+                        "executor": {"address": wallet},
+                        "contract": {"address": contract},
+                        "ton_attached": 5_200_000_000,
+                    },
+                },
+                {
+                    "type": "JettonTransfer",
+                    "status": "ok",
+                    "JettonTransfer": {
+                        "sender": {"address": contract},
+                        "recipient": {"address": wallet},
+                        "amount": "100000000000",
+                        "jetton": {
+                            "address": JETTON_ADDR,
+                            "name": "Foo",
+                            "symbol": "FOO",
+                            "decimals": 9,
+                        },
+                    },
+                },
+            ],
+        },
+        {
+            "event_id": "sell",
+            "timestamp": 200,
+            "actions": [
+                {
+                    "type": "JettonTransfer",
+                    "status": "ok",
+                    "JettonTransfer": {
+                        "sender": {"address": wallet},
+                        "recipient": {"address": contract},
+                        "amount": "50000000000",
+                        "jetton": {
+                            "address": JETTON_ADDR,
+                            "name": "Foo",
+                            "symbol": "FOO",
+                            "decimals": 9,
+                        },
+                    },
+                },
+                {
+                    "type": "TonTransfer",
+                    "status": "ok",
+                    "TonTransfer": {
+                        "sender": {"address": contract},
+                        "recipient": {"address": wallet},
+                        "amount": 3_000_000_000,
+                    },
+                },
+            ],
+        },
+    ]
+    swaps = extract_swaps(events, wallet_address=wallet)
+    assert len(swaps) == 2
+    assert swaps[0].asset_in.asset_id == TON_ASSET_ID
+    assert swaps[0].asset_out.asset_id == JETTON_ADDR
+    assert math.isclose(swaps[0].amount_in, 5.2)
+    assert math.isclose(swaps[0].amount_out, 100.0)
+    assert swaps[1].asset_in.asset_id == JETTON_ADDR
+    assert swaps[1].asset_out.asset_id == TON_ASSET_ID
+    assert math.isclose(swaps[1].amount_in, 50.0)
+    assert math.isclose(swaps[1].amount_out, 3.0)
+
+
+def test_extract_swaps_pool_event_buy_via_pool_sce() -> None:
+    """Pool events: TON arrives via SmartContractExec on the pool itself.
+
+    In DeDust pool events (GET /v2/accounts/{pool}/events) the executor is
+    the vault/router contract, not the user's wallet, and ton_attached are
+    the user's TON attached to the payout call.
+    """
+    pool = "0:8a1a62ca9ab30105d0790c92da556ce212361c34db5bc0703f4c0856cc377c88"
+    vault = "0:39a0ecdb99629b19178a27a5ea3269670df2381c3574a60af565227eca1673dd"
+    user = "0:b6b2033652c71af9a96551e47908f66e5a93821667738dab9805139eb5c44e55"
+    event = {
+        "event_id": "ev-pool-buy",
+        "timestamp": 100,
+        "account": {"address": pool, "is_wallet": False},
+        "actions": [
+            {
+                "type": "SmartContractExec",
+                "status": "ok",
+                "SmartContractExec": {
+                    "executor": {"address": vault, "is_wallet": False},
+                    "contract": {"address": pool, "is_wallet": False},
+                    "ton_attached": 198_079_058,
+                    "operation": "DedustPayoutFromPool",
+                    "payload": 'Amount: "17721960974981"\nRecipientAddr: 0:b6b2033652c71af9a96551e47908f66e5a93821667738dab9805139eb5c44e55',
+                },
+            },
+            {
+                "type": "JettonTransfer",
+                "status": "ok",
+                "JettonTransfer": {
+                    "sender": {"address": pool, "is_wallet": False},
+                    "recipient": {"address": user, "is_wallet": True},
+                    "amount": "17721960974981",
+                    "jetton": {
+                        "address": JETTON_ADDR,
+                        "name": "Foo",
+                        "symbol": "FOO",
+                        "decimals": 9,
+                    },
+                },
+            },
+        ],
+    }
+    swaps = extract_swaps([event], wallet_address=user)
+    assert len(swaps) == 1
+    assert swaps[0].asset_in.asset_id == TON_ASSET_ID
+    assert swaps[0].asset_out.asset_id == JETTON_ADDR
+    assert math.isclose(swaps[0].amount_in, 0.198_079_058)
+    assert math.isclose(swaps[0].amount_out, 17721.960974981)

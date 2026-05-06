@@ -23,6 +23,7 @@ from __future__ import annotations
 import logging
 from typing import Any
 
+from .address import friendly_to_raw
 from .models import TON_ASSET_ID, Swap, TokenInfo
 
 log = logging.getLogger(__name__)
@@ -36,9 +37,9 @@ NANO = 10**TON_DECIMALS
 # without the workchain prefix to match :func:`AccountAddress.address`.
 PROXY_TON_ADDRESSES = {
     # STON.fi v1 pTON (EQCM3B12QK1e4yZSf8GtBRT0aLMNyEsBc_DhVfRRtOEffLez)
-    "0:8cdc1d7640ad5ee32652e7c1ad0514f468b30dc8cb017f0e155f451b4e11f7cc",
+    "0:8cdc1d7640ad5ee326527fc1ad0514f468b30dc84b0173f0e155f451b4e11f7c",
     # STON.fi v2 pTON (EQBnFjAn9_hWWatVuCFnFohgHNzx7mdPx_u7Gndaiyaco6IO)
-    "0:671963027f7f85659ab55b821671688601cdcf1ee674fc7fbbb1a776a18d34a3",
+    "0:67163027f7f85659ab55b821671688601cdcf1ee674fc7fbbb1a775a8b269ca3",
 }
 
 
@@ -54,11 +55,20 @@ _TON_TOKEN = TokenInfo(
 def _is_proxy_ton(address: str | None) -> bool:
     if not address:
         return False
-    return address.lower() in PROXY_TON_ADDRESSES
+    return _normalize_address(address).lower() in PROXY_TON_ADDRESSES
+
+
+def _normalize_address(address: str) -> str:
+    if ":" in address:
+        return address
+    try:
+        return friendly_to_raw(address)
+    except (ValueError, IndexError):
+        return address
 
 
 def _jetton_token(jetton: dict[str, Any]) -> TokenInfo:
-    addr = jetton.get("address") or ""
+    addr = _normalize_address(jetton.get("address") or "")
     if _is_proxy_ton(addr):
         return _TON_TOKEN
     return TokenInfo(
@@ -172,6 +182,144 @@ def normalize_swap(event: dict[str, Any], action: dict[str, Any]) -> Swap | None
     )
 
 
+def _extract_ton_attached(event: dict[str, Any], wallet_address: str) -> int:
+    target = wallet_address.lower()
+    for action in event.get("actions") or []:
+        if action.get("type") != "SmartContractExec":
+            continue
+        payload = action.get("SmartContractExec") or {}
+        executor = (payload.get("executor") or {}).get("address") or ""
+        if executor.lower() != target:
+            continue
+        attached = _to_int(payload.get("ton_attached"))
+        if attached > 0:
+            return attached
+    # Fallback for pool events: the executor is the pool, not the user.
+    # Look for a TonTransfer from the user to the event's account (the pool).
+    pool_address = (event.get("account") or {}).get("address") or ""
+    if pool_address:
+        pool = pool_address.lower()
+        for action in event.get("actions") or []:
+            if action.get("type") != "TonTransfer":
+                continue
+            payload = action.get("TonTransfer") or {}
+            sender = (payload.get("sender") or {}).get("address") or ""
+            recipient = (payload.get("recipient") or {}).get("address") or ""
+            if sender.lower() == target and recipient.lower() == pool:
+                amount = _to_int(payload.get("amount"))
+                if amount > 0:
+                    return amount
+    # Fallback 3: pool events (e.g. DeDust) where TON reach the pool via
+    # SmartContractExec — the executor is the vault/router, not the user,
+    # and ton_attached are the user's TON. We intentionally do NOT enforce
+    # contract==pool because TonAPI may return friendly vs raw addresses.
+    for action in event.get("actions") or []:
+        if action.get("type") != "SmartContractExec":
+            continue
+        payload = action.get("SmartContractExec") or {}
+        attached = _to_int(payload.get("ton_attached"))
+        if attached > 0:
+            return attached
+    return 0
+
+
+def _extract_ton_received(event: dict[str, Any], wallet_address: str, sender_address: str) -> int:
+    target = wallet_address.lower()
+    sender = sender_address.lower()
+    total = 0
+    for action in event.get("actions") or []:
+        if action.get("type") != "TonTransfer":
+            continue
+        payload = action.get("TonTransfer") or {}
+        ton_sender = (payload.get("sender") or {}).get("address") or ""
+        recipient = (payload.get("recipient") or {}).get("address") or ""
+        if ton_sender.lower() == sender and recipient.lower() == target:
+            total += _to_int(payload.get("amount"))
+    return total
+
+
+def normalize_flawed_transfer_buy(
+    event: dict[str, Any], action: dict[str, Any], wallet_address: str
+) -> Swap | None:
+    payload = action.get("FlawedJettonTransfer") or {}
+    if not payload:
+        return None
+    recipient = (payload.get("recipient") or {}).get("address") or ""
+    if recipient.lower() != wallet_address.lower():
+        return None
+    ton_attached = _extract_ton_attached(event, wallet_address)
+    if ton_attached <= 0:
+        return None
+    raw_amount_out = _to_int(payload.get("received_amount"))
+    if raw_amount_out <= 0:
+        return None
+    asset_out = _jetton_token(payload.get("jetton") or {})
+    amount_out = _scale(raw_amount_out, asset_out.decimals)
+    return Swap(
+        timestamp=int(event.get("timestamp") or 0),
+        event_id=str(event.get("event_id") or ""),
+        dex="dedust",
+        asset_in=_TON_TOKEN,
+        asset_out=asset_out,
+        amount_in_raw=ton_attached,
+        amount_out_raw=raw_amount_out,
+        amount_in=ton_attached / NANO,
+        amount_out=amount_out,
+        ton_in=ton_attached / NANO,
+        ton_out=None,
+    )
+
+
+def normalize_transfer_swap(
+    event: dict[str, Any], action: dict[str, Any], wallet_address: str
+) -> Swap | None:
+    payload = action.get("JettonTransfer") or {}
+    if not payload:
+        return None
+    sender = (payload.get("sender") or {}).get("address") or ""
+    recipient = (payload.get("recipient") or {}).get("address") or ""
+    raw_jetton_amount = _to_int(payload.get("amount"))
+    if raw_jetton_amount <= 0:
+        return None
+    token = _jetton_token(payload.get("jetton") or {})
+    jetton_amount = _scale(raw_jetton_amount, token.decimals)
+    if recipient.lower() == wallet_address.lower():
+        ton_attached = _extract_ton_attached(event, wallet_address)
+        if ton_attached <= 0:
+            return None
+        return Swap(
+            timestamp=int(event.get("timestamp") or 0),
+            event_id=str(event.get("event_id") or ""),
+            dex="dedust",
+            asset_in=_TON_TOKEN,
+            asset_out=token,
+            amount_in_raw=ton_attached,
+            amount_out_raw=raw_jetton_amount,
+            amount_in=ton_attached / NANO,
+            amount_out=jetton_amount,
+            ton_in=ton_attached / NANO,
+            ton_out=None,
+        )
+    if sender.lower() == wallet_address.lower():
+        ton_received = _extract_ton_received(event, wallet_address, recipient)
+        if ton_received <= 0:
+            return None
+        return Swap(
+            timestamp=int(event.get("timestamp") or 0),
+            event_id=str(event.get("event_id") or ""),
+            dex="dedust",
+            asset_in=token,
+            asset_out=_TON_TOKEN,
+            amount_in_raw=raw_jetton_amount,
+            amount_out_raw=ton_received,
+            amount_in=jetton_amount,
+            amount_out=ton_received / NANO,
+            ton_in=None,
+            ton_out=ton_received / NANO,
+        )
+    return None
+
+
 def extract_swaps(events: list[dict[str, Any]], wallet_address: str | None = None) -> list[Swap]:
     """Walk all events and return JettonSwap actions ordered chronologically.
 
@@ -183,15 +331,24 @@ def extract_swaps(events: list[dict[str, Any]], wallet_address: str | None = Non
     target = (wallet_address or "").lower()
     swaps: list[Swap] = []
     for event in events:
+        has_explicit_swap = any(
+            action.get("type") == "JettonSwap" for action in event.get("actions") or []
+        )
         for action in event.get("actions") or []:
-            if action.get("type") != "JettonSwap":
+            action_type = action.get("type")
+            if action_type == "JettonSwap":
+                payload = action.get("JettonSwap") or {}
+                if target:
+                    user_wallet = (payload.get("user_wallet") or {}).get("address") or ""
+                    if user_wallet.lower() != target:
+                        continue
+                swap = normalize_swap(event, action)
+            elif action_type == "FlawedJettonTransfer" and target:
+                swap = normalize_flawed_transfer_buy(event, action, target)
+            elif action_type == "JettonTransfer" and target and not has_explicit_swap:
+                swap = normalize_transfer_swap(event, action, target)
+            else:
                 continue
-            payload = action.get("JettonSwap") or {}
-            if target:
-                user_wallet = (payload.get("user_wallet") or {}).get("address") or ""
-                if user_wallet.lower() != target:
-                    continue
-            swap = normalize_swap(event, action)
             if swap is not None:
                 swaps.append(swap)
     swaps.sort(key=lambda s: s.timestamp)

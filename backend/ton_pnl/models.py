@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Literal
+
 from pydantic import BaseModel, Field
 
 # Sentinel used to represent native TON inside maps keyed by jetton master address.
@@ -71,3 +73,51 @@ class PnLReport(BaseModel):
     tokens: list[TokenPnL]
     swaps: list[Swap]
     warnings: list[str] = []
+
+
+class TokenTraderRow(BaseModel):
+    wallet: str
+    token: TokenInfo
+    total_bought: float = 0.0
+    total_sold: float = 0.0
+    estimated_balance: float = 0.0
+    buy_volume_usd: float = 0.0
+    sell_volume_usd: float = 0.0
+    avg_buy_price_usd: float = 0.0
+    current_price_usd: float | None = None
+    current_value_usd: float = 0.0
+    realized_pnl_usd: float = 0.0
+    unrealized_pnl_usd: float = 0.0
+    total_pnl_usd: float = 0.0
+    trade_count: int = 0
+    first_trade_ts: int | None = None
+    last_trade_ts: int | None = None
+    only_sells: bool = False
+    sold_more_than_bought: bool = False
+
+
+class TokenAnalyticsProgress(BaseModel):
+    status: Literal["queued", "running", "completed", "failed"]
+    processed_events: int = 0
+    discovered_wallets: int = 0
+    processed_wallets: int = 0
+    trade_count: int = 0
+    message: str | None = None
+
+
+class TokenAnalyticsReport(BaseModel):
+    pool: str
+    token: TokenInfo
+    current_price_usd: float | None = None
+    trader_count: int
+    trade_count: int
+    processed_events: int
+    rows: list[TokenTraderRow]
+    warnings: list[str] = []
+
+
+class TokenAnalyticsJob(BaseModel):
+    job_id: str
+    progress: TokenAnalyticsProgress
+    report: TokenAnalyticsReport | None = None
+    error: str | None = None
