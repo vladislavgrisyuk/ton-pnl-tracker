@@ -188,3 +188,7 @@ class TonApiClient:
     async def get_jetton_balances(self, address: str) -> list[dict[str, Any]]:
         data = await self._get(f"/v2/accounts/{address}/jettons")
         return data.get("balances") or []
+
+    async def get_jetton_info(self, address: str) -> dict[str, Any]:
+        """Fetch jetton master metadata (symbol, decimals, name, image)."""
+        return await self._get(f"/v2/jettons/{address}")

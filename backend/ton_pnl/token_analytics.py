@@ -8,7 +8,11 @@ from typing import Any
 from .address import friendly_to_raw
 from .models import TON_ASSET_ID, Swap, TokenAnalyticsReport, TokenInfo, TokenTraderRow
 from .pricing import PriceService, annotate_usd_values
-from .swaps import extract_swaps, normalize_swap
+from .swaps import (
+    extract_dedust_pool_swaps,
+    extract_swaps,
+    normalize_swap,
+)
 from .tonapi import TonApiClient
 
 ProgressCallback = Callable[[int, int, int, str], Awaitable[None]]
@@ -134,7 +138,12 @@ def _choose_token(trader_swaps: list[TraderSwap], token_address: str | None) -> 
                 return item.swap.asset_in
             if item.swap.asset_out.asset_id.lower() == target:
                 return item.swap.asset_out
-        return TokenInfo(asset_id=to_raw_address(token_address), symbol="?", name=to_raw_address(token_address)[:8], decimals=9)
+        return TokenInfo(
+            asset_id=to_raw_address(token_address),
+            symbol="?",
+            name=to_raw_address(token_address)[:8],
+            decimals=9,
+        )
     counts: Counter[str] = Counter()
     metas: dict[str, TokenInfo] = {}
     for item in trader_swaps:
@@ -174,13 +183,21 @@ def _build_rows(
         if not changed:
             continue
         row.trade_count += 1
-        row.first_trade_ts = swap.timestamp if row.first_trade_ts is None else min(row.first_trade_ts, swap.timestamp)
-        row.last_trade_ts = swap.timestamp if row.last_trade_ts is None else max(row.last_trade_ts, swap.timestamp)
+        row.first_trade_ts = (
+            swap.timestamp
+            if row.first_trade_ts is None
+            else min(row.first_trade_ts, swap.timestamp)
+        )
+        row.last_trade_ts = (
+            swap.timestamp if row.last_trade_ts is None else max(row.last_trade_ts, swap.timestamp)
+        )
 
     rows: list[TokenTraderRow] = []
     for wallet, total in totals.items():
         estimated_balance = total.total_bought - total.total_sold
-        current_value = max(estimated_balance, 0.0) * current_price_usd if current_price_usd else 0.0
+        current_value = (
+            max(estimated_balance, 0.0) * current_price_usd if current_price_usd else 0.0
+        )
         realized = total.sell_volume_usd - total.buy_volume_usd
         unrealized = current_value
         avg_buy_price = total.buy_volume_usd / total.total_bought if total.total_bought > 0 else 0.0
@@ -206,8 +223,43 @@ def _build_rows(
                 sold_more_than_bought=estimated_balance < -1e-12,
             )
         )
-    rows.sort(key=lambda row: (row.last_trade_ts or 0), reverse=True)
+    rows.sort(key=lambda row: row.last_trade_ts or 0, reverse=True)
     return rows
+
+
+async def _fetch_jetton_token(ton: TonApiClient, asset_id: str) -> TokenInfo | None:
+    """Pull jetton metadata from tonapi when no JettonSwap event reveals it."""
+    try:
+        info = await ton.get_jetton_info(asset_id)
+    except Exception:  # noqa: BLE001 - upstream may be flaky / wrong address
+        return None
+    metadata = info.get("metadata") or {}
+    decimals_raw = metadata.get("decimals")
+    try:
+        decimals = int(decimals_raw) if decimals_raw is not None else 9
+    except (TypeError, ValueError):
+        decimals = 9
+    symbol = metadata.get("symbol") or "?"
+    name = metadata.get("name") or symbol or asset_id[:8]
+    image = metadata.get("image")
+    return TokenInfo(
+        asset_id=asset_id,
+        symbol=symbol,
+        name=name,
+        decimals=decimals,
+        image=image,
+    )
+
+
+def _swap_dedup_key(wallet: str, swap: Swap) -> tuple[str, str, str, str, int, int]:
+    return (
+        wallet.lower(),
+        swap.event_id,
+        swap.asset_in.asset_id,
+        swap.asset_out.asset_id,
+        swap.amount_in_raw,
+        swap.amount_out_raw,
+    )
 
 
 async def analyze_pool_traders(
@@ -226,8 +278,10 @@ async def analyze_pool_traders(
     before_lt: int | None = None
     events_seen = 0
     trader_swaps: list[TraderSwap] = []
+    seen_keys: set[tuple[str, str, str, str, int, int]] = set()
     wallets: set[str] = set()
     warnings: list[str] = []
+    all_events: list[dict[str, Any]] = []
 
     if progress is not None:
         await progress(0, 0, 0, "Fetching pool events")
@@ -242,9 +296,15 @@ async def analyze_pool_traders(
         if not page_events:
             break
         events_seen += len(page_events)
+        all_events.extend(page_events)
         page_swaps = extract_pool_trader_swaps(page_events)
-        trader_swaps.extend(page_swaps)
-        wallets.update(item.wallet for item in page_swaps)
+        for item in page_swaps:
+            key = _swap_dedup_key(item.wallet, item.swap)
+            if key in seen_keys:
+                continue
+            seen_keys.add(key)
+            trader_swaps.append(item)
+            wallets.add(item.wallet)
         if progress is not None:
             await progress(events_seen, len(wallets), len(trader_swaps), "Fetching pool events")
         if not next_from or next_from == 0:
@@ -252,8 +312,33 @@ async def analyze_pool_traders(
         before_lt = next_from
 
     token = _choose_token(trader_swaps, token_address)
+    # If we did not see any JettonSwap-based hint but the user named a token,
+    # grab its metadata directly so DeDust SCE-pair (BUY) reconstruction works.
+    if (token is None or token.asset_id == TON_ASSET_ID) and token_address:
+        fetched = await _fetch_jetton_token(ton, to_raw_address(token_address))
+        if fetched is not None:
+            token = fetched
+
+    # Phase 2: reconstruct DeDust pool BUYs (and any sells that tonapi did not
+    # bundle as JettonSwap) from the SCE pair pattern.
+    if token is not None and token.asset_id != TON_ASSET_ID:
+        for wallet, swap in extract_dedust_pool_swaps(all_events, token):
+            key = _swap_dedup_key(wallet, swap)
+            if key in seen_keys:
+                continue
+            seen_keys.add(key)
+            trader_swaps.append(TraderSwap(wallet=wallet, swap=swap))
+            wallets.add(wallet)
+
+    trader_swaps.sort(key=lambda item: item.swap.timestamp)
+
     if token is None:
-        token = TokenInfo(asset_id=token_address or normalized_pool, symbol="?", name="Unknown token", decimals=9)
+        token = TokenInfo(
+            asset_id=token_address or normalized_pool,
+            symbol="?",
+            name="Unknown token",
+            decimals=9,
+        )
         warnings.append("No non-TON token swaps were found in the fetched pool events.")
 
     if progress is not None:

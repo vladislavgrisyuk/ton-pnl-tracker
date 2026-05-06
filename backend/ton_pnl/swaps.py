@@ -21,6 +21,7 @@ sides where TON is represented by the sentinel :data:`TON_ASSET_ID`.
 from __future__ import annotations
 
 import logging
+import re
 from typing import Any
 
 from .address import friendly_to_raw
@@ -353,3 +354,162 @@ def extract_swaps(events: list[dict[str, Any]], wallet_address: str | None = Non
                 swaps.append(swap)
     swaps.sort(key=lambda s: s.timestamp)
     return swaps
+
+
+# --- DeDust pool-side reconstruction ----------------------------------------
+#
+# When we query events on a DeDust pool address (instead of a wallet),
+# tonapi often only bundles SELLs of the pool's jetton into a tidy
+# ``JettonSwap`` action. BUYs (TON-in / jetton-out) are not bundled — they
+# arrive as a pair of ``SmartContractExec`` actions:
+#
+#   1. ``DedustSwapExternal`` (router/native-vault → pool): announces a swap
+#      with input asset ``Amount`` and ``KindOut`` (false = output is jetton,
+#      true = output is TON), plus the user's ``SenderAddr`` / ``RecipientAddr``.
+#   2. ``DedustPayoutFromPool`` (pool → output vault): the output asset's raw
+#      ``Amount`` and the user's ``RecipientAddr``.
+#
+# Both share a ``QueryId`` we use to pair them inside the same trace.
+
+DEDUST_SWAP_EXTERNAL = "DedustSwapExternal"
+DEDUST_PAYOUT_FROM_POOL = "DedustPayoutFromPool"
+
+_PAYLOAD_KV_RE = re.compile(r"^\s*([A-Za-z]+):\s*(.+?)\s*$")
+
+
+def _parse_dedust_payload(text: str | None) -> dict[str, str]:
+    """Parse the YAML-ish ``payload`` string emitted with a DeDust SCE action."""
+    out: dict[str, str] = {}
+    if not text:
+        return out
+    for line in text.split("\n"):
+        match = _PAYLOAD_KV_RE.match(line)
+        if not match:
+            continue
+        key, value = match.group(1), match.group(2)
+        if value.startswith('"') and value.endswith('"'):
+            value = value[1:-1]
+        out[key] = value
+    return out
+
+
+def normalize_dedust_pool_swap(
+    event: dict[str, Any],
+    swap_external_action: dict[str, Any],
+    payout_action: dict[str, Any],
+    target_token: TokenInfo,
+) -> tuple[str, Swap] | None:
+    """Reconstruct a :class:`Swap` from a paired DeDust SCE action set.
+
+    ``target_token`` provides the jetton metadata (decimals, symbol) for the
+    non-TON side of the swap, since the pool-side trace does not include it
+    inline. Returns ``(user_wallet_raw_hex, Swap)`` or ``None`` if the actions
+    don't form a coherent swap (refund, missing fields, malformed numbers).
+    """
+    if not target_token or target_token.asset_id == TON_ASSET_ID:
+        return None
+    swap_kv = _parse_dedust_payload(
+        (swap_external_action.get("SmartContractExec") or {}).get("payload")
+    )
+    payout_kv = _parse_dedust_payload((payout_action.get("SmartContractExec") or {}).get("payload"))
+    user_wallet = (
+        swap_kv.get("SenderAddr")
+        or swap_kv.get("RecipientAddr")
+        or payout_kv.get("RecipientAddr")
+        or ""
+    ).strip()
+    if not user_wallet:
+        return None
+    user_wallet = _normalize_address(user_wallet)
+    amount_in_raw = _to_int(swap_kv.get("Amount"))
+    amount_out_raw = _to_int(payout_kv.get("Amount"))
+    if amount_in_raw <= 0 or amount_out_raw <= 0:
+        return None
+    if amount_in_raw == amount_out_raw:
+        # Refund / no-op — both legs report the same number.
+        return None
+    output_is_ton = swap_kv.get("KindOut", "").strip().lower() == "true"
+    if output_is_ton:
+        # SELL: jetton in, TON out.
+        asset_in = target_token
+        asset_out = _TON_TOKEN
+        amount_in = _scale(amount_in_raw, target_token.decimals)
+        amount_out = amount_out_raw / NANO
+        ton_in_value: float | None = None
+        ton_out_value: float | None = amount_out
+    else:
+        # BUY: TON in, jetton out.
+        asset_in = _TON_TOKEN
+        asset_out = target_token
+        amount_in = amount_in_raw / NANO
+        amount_out = _scale(amount_out_raw, target_token.decimals)
+        ton_in_value = amount_in
+        ton_out_value = None
+    return user_wallet, Swap(
+        timestamp=int(event.get("timestamp") or 0),
+        event_id=str(event.get("event_id") or ""),
+        dex="dedust",
+        asset_in=asset_in,
+        asset_out=asset_out,
+        amount_in_raw=amount_in_raw,
+        amount_out_raw=amount_out_raw,
+        amount_in=amount_in,
+        amount_out=amount_out,
+        ton_in=ton_in_value,
+        ton_out=ton_out_value,
+    )
+
+
+def extract_dedust_pool_swaps(
+    events: list[dict[str, Any]],
+    target_token: TokenInfo | None,
+) -> list[tuple[str, Swap]]:
+    """Find DedustSwapExternal+DedustPayoutFromPool pairs and synthesize swaps.
+
+    Each yielded item is ``(user_wallet_raw, Swap)``. Pairs are matched by
+    their ``QueryId`` so multi-hop traces with several swaps in one event are
+    handled. Falls back to positional matching when QueryId is unavailable.
+    """
+    if target_token is None or target_token.asset_id == TON_ASSET_ID:
+        return []
+    out: list[tuple[str, Swap]] = []
+    for event in events:
+        swap_exts: list[tuple[str, dict[str, Any]]] = []
+        payouts: list[tuple[str, dict[str, Any]]] = []
+        for action in event.get("actions") or []:
+            if action.get("type") != "SmartContractExec":
+                continue
+            sce = action.get("SmartContractExec") or {}
+            op = sce.get("operation")
+            if op == DEDUST_SWAP_EXTERNAL:
+                qid = _parse_dedust_payload(sce.get("payload")).get("QueryId", "")
+                swap_exts.append((qid, action))
+            elif op == DEDUST_PAYOUT_FROM_POOL:
+                qid = _parse_dedust_payload(sce.get("payload")).get("QueryId", "")
+                payouts.append((qid, action))
+        if not swap_exts or not payouts:
+            continue
+        # Pair by QueryId when present; otherwise by position.
+        used_payouts: set[int] = set()
+        for qid, swap_ext in swap_exts:
+            payout_idx: int | None = None
+            if qid:
+                for i, (pq, _payout) in enumerate(payouts):
+                    if i in used_payouts:
+                        continue
+                    if pq == qid:
+                        payout_idx = i
+                        break
+            if payout_idx is None:
+                for i in range(len(payouts)):
+                    if i not in used_payouts:
+                        payout_idx = i
+                        break
+            if payout_idx is None:
+                continue
+            used_payouts.add(payout_idx)
+            payout = payouts[payout_idx][1]
+            result = normalize_dedust_pool_swap(event, swap_ext, payout, target_token)
+            if result:
+                out.append(result)
+    return out

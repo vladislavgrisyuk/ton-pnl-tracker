@@ -6,7 +6,7 @@ import math
 
 from ton_pnl.models import TON_ASSET_ID, Swap, TokenInfo
 from ton_pnl.pnl import compute_pnl
-from ton_pnl.swaps import extract_swaps
+from ton_pnl.swaps import extract_dedust_pool_swaps, extract_swaps
 
 JETTON_ADDR = "0:abcd00000000000000000000000000000000000000000000000000000000abcd"
 JETTON = TokenInfo(asset_id=JETTON_ADDR, symbol="FOO", name="Foo Token", decimals=9)
@@ -443,3 +443,159 @@ def test_extract_swaps_pool_event_buy_via_pool_sce() -> None:
     assert swaps[0].asset_out.asset_id == JETTON_ADDR
     assert math.isclose(swaps[0].amount_in, 0.198_079_058)
     assert math.isclose(swaps[0].amount_out, 17721.960974981)
+
+
+def _dedust_swap_external(
+    *, kind_out: bool, amount_in_raw: int, sender: str, query_id: str = "1"
+) -> dict:
+    return {
+        "type": "SmartContractExec",
+        "status": "ok",
+        "SmartContractExec": {
+            "executor": {"address": "0:dae153a74d894bbc"},
+            "contract": {"address": "0:39a0ecdb99629b19"},
+            "ton_attached": 199_502_798,
+            "operation": "DedustSwapExternal",
+            "payload": (
+                f'Amount: "{amount_in_raw}"\n'
+                f"Current:\n"
+                f"  KindOut: {'true' if kind_out else 'false'}\n"
+                f'  Limit: "0"\n'
+                f"  Next: null\n"
+                f"QueryId: {query_id}\n"
+                f"SenderAddr: {sender}\n"
+                f"SwapParams:\n"
+                f"  Deadline: 1778069866\n"
+                f"  RecipientAddr: {sender}\n"
+            ),
+        },
+    }
+
+
+def _dedust_payout_from_pool(*, amount_out_raw: int, recipient: str, query_id: str = "1") -> dict:
+    return {
+        "type": "SmartContractExec",
+        "status": "ok",
+        "SmartContractExec": {
+            "executor": {"address": "0:39a0ecdb99629b19"},
+            "contract": {"address": "0:8a1a62ca9ab30105"},
+            "ton_attached": 198_079_058,
+            "operation": "DedustPayoutFromPool",
+            "payload": (
+                f'Amount: "{amount_out_raw}"\n'
+                f"Payload: null\n"
+                f"QueryId: {query_id}\n"
+                f"RecipientAddr: {recipient}\n"
+            ),
+        },
+    }
+
+
+def test_extract_dedust_pool_swaps_buy() -> None:
+    """DeDust pool BUY: paired SCE actions reconstruct as TON→jetton swap."""
+    user = "0:546e4b605cff5d4a022172803a0c037cc7739e6fd136b6f84ae1ebb058c0f5e4"
+    event = {
+        "event_id": "ev-buy",
+        "timestamp": 1_700_000_000,
+        "actions": [
+            _dedust_swap_external(kind_out=False, amount_in_raw=20_000_000_000, sender=user),
+            _dedust_payout_from_pool(amount_out_raw=76_996_315_246_370, recipient=user),
+        ],
+    }
+    pairs = extract_dedust_pool_swaps([event], JETTON)
+    assert len(pairs) == 1
+    wallet, swap = pairs[0]
+    assert wallet == user
+    assert swap.asset_in.asset_id == TON_ASSET_ID
+    assert swap.asset_out.asset_id == JETTON_ADDR
+    assert math.isclose(swap.amount_in, 20.0, abs_tol=1e-9)
+    assert math.isclose(swap.amount_out, 76_996.315_246_370, abs_tol=1e-3)
+    assert swap.ton_in == 20.0
+    assert swap.ton_out is None
+    assert swap.dex == "dedust"
+
+
+def test_extract_dedust_pool_swaps_sell() -> None:
+    """DeDust pool SELL: KindOut=true means output is TON, input is jetton."""
+    user = "0:b4d19ef7122c68d877ebb084c4c5c465285efbb954f5c67125b77679fc26cbd8"
+    event = {
+        "event_id": "ev-sell",
+        "timestamp": 1_700_000_100,
+        "actions": [
+            _dedust_swap_external(kind_out=True, amount_in_raw=203_325_109_936_319, sender=user),
+            _dedust_payout_from_pool(amount_out_raw=52_050_933_060, recipient=user),
+        ],
+    }
+    pairs = extract_dedust_pool_swaps([event], JETTON)
+    assert len(pairs) == 1
+    wallet, swap = pairs[0]
+    assert wallet == user
+    assert swap.asset_in.asset_id == JETTON_ADDR
+    assert swap.asset_out.asset_id == TON_ASSET_ID
+    assert math.isclose(swap.amount_in, 203_325.109_936_319, abs_tol=1e-3)
+    assert math.isclose(swap.amount_out, 52.050_933_060, abs_tol=1e-9)
+    assert swap.ton_in is None
+    assert swap.ton_out == 52.050_933_060
+
+
+def test_extract_dedust_pool_swaps_skips_refund() -> None:
+    """When swap-external Amount equals payout Amount the trace is a refund."""
+    user = "0:11" + "0" * 60
+    event = {
+        "event_id": "ev-refund",
+        "timestamp": 1_700_000_200,
+        "actions": [
+            _dedust_swap_external(kind_out=False, amount_in_raw=15_769_936_267, sender=user),
+            _dedust_payout_from_pool(amount_out_raw=15_769_936_267, recipient=user),
+        ],
+    }
+    assert extract_dedust_pool_swaps([event], JETTON) == []
+
+
+def test_extract_dedust_pool_swaps_pairs_by_query_id() -> None:
+    """Two distinct swaps in one trace are paired by their QueryId fields."""
+    user_a = "0:aa" + "0" * 60
+    user_b = "0:bb" + "0" * 60
+    event = {
+        "event_id": "ev-multi",
+        "timestamp": 1_700_000_300,
+        "actions": [
+            _dedust_swap_external(
+                kind_out=False, amount_in_raw=10_000_000_000, sender=user_a, query_id="100"
+            ),
+            _dedust_swap_external(
+                kind_out=True, amount_in_raw=500_000_000_000, sender=user_b, query_id="200"
+            ),
+            # Intentionally out-of-order to exercise QueryId pairing.
+            _dedust_payout_from_pool(
+                amount_out_raw=10_000_000_000_000, recipient=user_a, query_id="100"
+            ),
+            _dedust_payout_from_pool(
+                amount_out_raw=99_000_000_000, recipient=user_b, query_id="200"
+            ),
+        ],
+    }
+    pairs = extract_dedust_pool_swaps([event], JETTON)
+    assert len(pairs) == 2
+    by_wallet = {wallet: swap for wallet, swap in pairs}
+    buy = by_wallet[user_a]
+    sell = by_wallet[user_b]
+    assert buy.asset_in.asset_id == TON_ASSET_ID
+    assert buy.asset_out.asset_id == JETTON_ADDR
+    assert sell.asset_in.asset_id == JETTON_ADDR
+    assert sell.asset_out.asset_id == TON_ASSET_ID
+
+
+def test_extract_dedust_pool_swaps_requires_jetton_token() -> None:
+    """Without a target jetton we cannot annotate the non-TON side and skip."""
+    user = "0:cc" + "0" * 60
+    event = {
+        "event_id": "ev-no-token",
+        "timestamp": 1_700_000_400,
+        "actions": [
+            _dedust_swap_external(kind_out=False, amount_in_raw=10_000_000_000, sender=user),
+            _dedust_payout_from_pool(amount_out_raw=20_000_000_000, recipient=user),
+        ],
+    }
+    assert extract_dedust_pool_swaps([event], None) == []
+    assert extract_dedust_pool_swaps([event], TON_TOKEN) == []
