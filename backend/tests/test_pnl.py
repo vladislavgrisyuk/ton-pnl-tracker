@@ -445,9 +445,29 @@ def test_extract_swaps_pool_event_buy_via_pool_sce() -> None:
     assert math.isclose(swaps[0].amount_out, 17721.960974981)
 
 
+_DEDUST_NATIVE_PROOF = (
+    "b5ee9c72010101010025000045800be0ac9f6bec08f07b6ae0639c39ecd1511a9a9adb4dbc9b6"
+    "445697241adfb000021"
+)
+_DEDUST_JETTON_PROOF = (
+    "b5ee9c72010101010046000087800be0ac9f6bec08f07b6ae0639c39ecd1511a9a9adb4dbc9b6"
+    "445697241adfb00002201f376d013fbb9543e845e202d998d48f41969489d0399f74cbb68d439"
+    "645512dd"
+)
+
+
 def _dedust_swap_external(
-    *, kind_out: bool, amount_in_raw: int, sender: str, query_id: str = "1"
+    *,
+    kind_out: bool,
+    amount_in_raw: int,
+    sender: str,
+    query_id: str = "1",
+    proof: str | None = None,
 ) -> dict:
+    # Default proof: TON-vault for buys (kind_out=False), jetton-vault for
+    # sells (kind_out=True). Tests can override to model multi-hop traces.
+    if proof is None:
+        proof = _DEDUST_JETTON_PROOF if kind_out else _DEDUST_NATIVE_PROOF
     return {
         "type": "SmartContractExec",
         "status": "ok",
@@ -462,6 +482,7 @@ def _dedust_swap_external(
                 f"  KindOut: {'true' if kind_out else 'false'}\n"
                 f'  Limit: "0"\n'
                 f"  Next: null\n"
+                f"Proof: {proof}\n"
                 f"QueryId: {query_id}\n"
                 f"SenderAddr: {sender}\n"
                 f"SwapParams:\n"
@@ -552,8 +573,12 @@ def test_extract_dedust_pool_swaps_skips_refund() -> None:
     assert extract_dedust_pool_swaps([event], JETTON) == []
 
 
-def test_extract_dedust_pool_swaps_pairs_by_query_id() -> None:
-    """Two distinct swaps in one trace are paired by their QueryId fields."""
+def test_extract_dedust_pool_swaps_skips_multi_hop() -> None:
+    """Multi-hop traces (multiple SCE pairs in one event) are intentionally
+    skipped because the upstream SwapExternal Amount is denominated in some
+    pre-route asset (not TON), and treating it as TON-in produces grossly
+    inflated buy volume.
+    """
     user_a = "0:aa" + "0" * 60
     user_b = "0:bb" + "0" * 60
     event = {
@@ -566,7 +591,6 @@ def test_extract_dedust_pool_swaps_pairs_by_query_id() -> None:
             _dedust_swap_external(
                 kind_out=True, amount_in_raw=500_000_000_000, sender=user_b, query_id="200"
             ),
-            # Intentionally out-of-order to exercise QueryId pairing.
             _dedust_payout_from_pool(
                 amount_out_raw=10_000_000_000_000, recipient=user_a, query_id="100"
             ),
@@ -575,15 +599,46 @@ def test_extract_dedust_pool_swaps_pairs_by_query_id() -> None:
             ),
         ],
     }
-    pairs = extract_dedust_pool_swaps([event], JETTON)
-    assert len(pairs) == 2
-    by_wallet = {wallet: swap for wallet, swap in pairs}
-    buy = by_wallet[user_a]
-    sell = by_wallet[user_b]
-    assert buy.asset_in.asset_id == TON_ASSET_ID
-    assert buy.asset_out.asset_id == JETTON_ADDR
-    assert sell.asset_in.asset_id == JETTON_ADDR
-    assert sell.asset_out.asset_id == TON_ASSET_ID
+    assert extract_dedust_pool_swaps([event], JETTON) == []
+
+
+def test_extract_dedust_pool_swaps_skips_routed_buy() -> None:
+    """Single-hop traces whose SwapExternal Proof claims a jetton-vault input
+    (rather than the native TON vault) are the tail of a multi-hop and would
+    inflate buy USD if treated as TON-in. They must be skipped.
+    """
+    user = "0:dd" + "0" * 60
+    event = {
+        "event_id": "ev-routed-buy",
+        "timestamp": 1_700_000_700,
+        "actions": [
+            _dedust_swap_external(
+                kind_out=False,
+                amount_in_raw=231_492_324_667_621,  # would imply $530K of TON
+                sender=user,
+                proof=_DEDUST_JETTON_PROOF,
+            ),
+            _dedust_payout_from_pool(amount_out_raw=38_839_069_724, recipient=user),
+        ],
+    }
+    assert extract_dedust_pool_swaps([event], JETTON) == []
+
+
+def test_extract_dedust_pool_swaps_skips_jetton_master() -> None:
+    """Internal contract operations from the jetton master itself aren't
+    real user trades and must be filtered out.
+    """
+    event = {
+        "event_id": "ev-master",
+        "timestamp": 1_700_000_500,
+        "actions": [
+            _dedust_swap_external(
+                kind_out=False, amount_in_raw=2_847_378_365_823_771, sender=JETTON_ADDR
+            ),
+            _dedust_payout_from_pool(amount_out_raw=496_381_554_251, recipient=JETTON_ADDR),
+        ],
+    }
+    assert extract_dedust_pool_swaps([event], JETTON) == []
 
 
 def test_extract_dedust_pool_swaps_requires_jetton_token() -> None:

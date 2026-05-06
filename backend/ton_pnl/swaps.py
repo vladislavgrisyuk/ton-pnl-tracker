@@ -376,6 +376,13 @@ DEDUST_PAYOUT_FROM_POOL = "DedustPayoutFromPool"
 
 _PAYLOAD_KV_RE = re.compile(r"^\s*([A-Za-z]+):\s*(.+?)\s*$")
 
+# DeDust BoC ``Proof`` blob signature for the **native (TON) vault** swap input.
+# The leading ``b5ee9c72`` is BoC magic; ``010101010025`` is the cell-table
+# header that encodes a single 0x25-byte cell holding only the TON sender
+# address — i.e. an input from the native vault. Jetton-vault swaps use a
+# 0x46-byte cell that additionally carries the jetton master reference.
+_DEDUST_NATIVE_VAULT_PROOF_PREFIX = "b5ee9c72010101010025"
+
 
 def _parse_dedust_payload(text: str | None) -> dict[str, str]:
     """Parse the YAML-ish ``payload`` string emitted with a DeDust SCE action."""
@@ -429,8 +436,13 @@ def normalize_dedust_pool_swap(
         # Refund / no-op — both legs report the same number.
         return None
     output_is_ton = swap_kv.get("KindOut", "").strip().lower() == "true"
+    proof_hex = (swap_kv.get("Proof") or "").strip().lower()
+    input_is_native_ton = proof_hex.startswith(_DEDUST_NATIVE_VAULT_PROOF_PREFIX)
     if output_is_ton:
-        # SELL: jetton in, TON out.
+        # SELL: jetton in, TON out. The input vault must be the jetton vault
+        # (long-form Proof). Reject if Proof claims native TON input.
+        if input_is_native_ton:
+            return None
         asset_in = target_token
         asset_out = _TON_TOKEN
         amount_in = _scale(amount_in_raw, target_token.decimals)
@@ -438,7 +450,13 @@ def normalize_dedust_pool_swap(
         ton_in_value: float | None = None
         ton_out_value: float | None = amount_out
     else:
-        # BUY: TON in, jetton out.
+        # BUY: TON in, jetton out. The input vault must be the native (TON)
+        # vault. A jetton-vault Proof here means the swap is the tail of a
+        # multi-hop where the upstream Amount is in some other jetton — not
+        # TON — and treating it as TON-in inflates buy USD by orders of
+        # magnitude. Skip those traces.
+        if not input_is_native_ton:
+            return None
         asset_in = _TON_TOKEN
         asset_out = target_token
         amount_in = amount_in_raw / NANO
@@ -466,50 +484,44 @@ def extract_dedust_pool_swaps(
 ) -> list[tuple[str, Swap]]:
     """Find DedustSwapExternal+DedustPayoutFromPool pairs and synthesize swaps.
 
-    Each yielded item is ``(user_wallet_raw, Swap)``. Pairs are matched by
-    their ``QueryId`` so multi-hop traces with several swaps in one event are
-    handled. Falls back to positional matching when QueryId is unavailable.
+    Each yielded item is ``(user_wallet_raw, Swap)``. Only single-hop traces
+    (exactly one SwapExternal + one PayoutFromPool in the event) are emitted.
+    Multi-hop traces have multiple SCE pairs where the first ``Amount`` is the
+    pre-routed value in some upstream asset (not TON), which would otherwise
+    inflate inferred buy volume by orders of magnitude.
+
+    Pairs whose ``SenderAddr`` is the jetton master itself are also skipped —
+    those are internal contract operations, not real user trades.
     """
     if target_token is None or target_token.asset_id == TON_ASSET_ID:
         return []
     out: list[tuple[str, Swap]] = []
+    target_master_raw = _normalize_address(target_token.asset_id).lower()
     for event in events:
-        swap_exts: list[tuple[str, dict[str, Any]]] = []
-        payouts: list[tuple[str, dict[str, Any]]] = []
+        swap_exts: list[dict[str, Any]] = []
+        payouts: list[dict[str, Any]] = []
         for action in event.get("actions") or []:
             if action.get("type") != "SmartContractExec":
                 continue
             sce = action.get("SmartContractExec") or {}
             op = sce.get("operation")
             if op == DEDUST_SWAP_EXTERNAL:
-                qid = _parse_dedust_payload(sce.get("payload")).get("QueryId", "")
-                swap_exts.append((qid, action))
+                swap_exts.append(action)
             elif op == DEDUST_PAYOUT_FROM_POOL:
-                qid = _parse_dedust_payload(sce.get("payload")).get("QueryId", "")
-                payouts.append((qid, action))
-        if not swap_exts or not payouts:
+                payouts.append(action)
+        # Only single-hop traces. Multi-hop ``Amount`` semantics are unreliable
+        # because the first SwapExternal carries the route-input value in the
+        # upstream asset, not in TON.
+        if len(swap_exts) != 1 or len(payouts) != 1:
             continue
-        # Pair by QueryId when present; otherwise by position.
-        used_payouts: set[int] = set()
-        for qid, swap_ext in swap_exts:
-            payout_idx: int | None = None
-            if qid:
-                for i, (pq, _payout) in enumerate(payouts):
-                    if i in used_payouts:
-                        continue
-                    if pq == qid:
-                        payout_idx = i
-                        break
-            if payout_idx is None:
-                for i in range(len(payouts)):
-                    if i not in used_payouts:
-                        payout_idx = i
-                        break
-            if payout_idx is None:
-                continue
-            used_payouts.add(payout_idx)
-            payout = payouts[payout_idx][1]
-            result = normalize_dedust_pool_swap(event, swap_ext, payout, target_token)
-            if result:
-                out.append(result)
+        swap_ext = swap_exts[0]
+        payout = payouts[0]
+        swap_kv = _parse_dedust_payload((swap_ext.get("SmartContractExec") or {}).get("payload"))
+        sender = _normalize_address(swap_kv.get("SenderAddr") or "").lower()
+        if sender and sender == target_master_raw:
+            # The jetton master itself isn't a real trader.
+            continue
+        result = normalize_dedust_pool_swap(event, swap_ext, payout, target_token)
+        if result:
+            out.append(result)
     return out
