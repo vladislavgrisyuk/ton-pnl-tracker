@@ -9,6 +9,9 @@ dependencies = [
     "httpx>=0.27",
     "pydantic>=2.9",
     "pydantic-settings>=2.6",
+    # Optional but cheap: needed for the tonviewer.com proxy mode (CryptoJS-style
+    # AES decryption). Pulling in unconditionally keeps install paths simple.
+    "pycryptodome>=3.20",
 ]
 
 [project.optional-dependencies]

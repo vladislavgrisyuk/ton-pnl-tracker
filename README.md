@@ -102,10 +102,25 @@ For every `JettonSwap` we record the swap's USD value at the candle covering its
 
 ## Data sources
 
-- **tonapi.io** for account events, jetton balances, account info.
+- **tonapi.io** for account events, jetton balances, account info. Endpoints used: `/v2/accounts/{addr}`, `/v2/accounts/{addr}/events`, `/v2/accounts/{addr}/jettons`.
 - **GeckoTerminal** for top liquidity pools, OHLCV history, and current USD prices.
 
 Both are public APIs with rate limits — the backend retries on 429/5xx with exponential backoff and caches per-wallet reports for 5 minutes.
+
+### Optional: tonviewer.com proxy mode
+
+If the direct tonapi.io rate limits are too tight for your workload, you can route all tonapi calls through the tonviewer.com frontend proxy:
+
+```env
+TON_PNL_TONAPI_BASE_URL=https://tonviewer.com/api/tonapi
+TON_PNL_TONAPI_HEADERS='{"User-Agent":"Mozilla/5.0 ...","Referer":"https://tonviewer.com/"}'
+# Optional, only needed if tonviewer rotates their key:
+# TON_PNL_TONVIEWER_PASSPHRASE=tv22-asrr11
+```
+
+tonviewer returns AES-encrypted bodies (CryptoJS-style `Salted__` blobs); the backend detects this from the base URL and transparently decrypts them using `TON_PNL_TONVIEWER_PASSPHRASE`. The default passphrase matches what their JS bundle ships today (extracted from `pages/_app-*.js`). In our local benchmarks we got ~30 RPS sustained on the public proxy with no rate limiting. Cookies are usually optional — `User-Agent` + `Referer` is enough to pass their WAF most of the time. If they ever rotate the encryption key, override `TON_PNL_TONVIEWER_PASSPHRASE` (you can grep their JS bundle for `AES.decrypt(`).
+
+For long-term production use prefer a paid tonconsole.com key via `TON_PNL_TONAPI_TOKEN` — the tonviewer proxy is best-effort and could break at any time.
 
 ## Limitations
 
