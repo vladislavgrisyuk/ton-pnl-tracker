@@ -26,3 +26,9 @@ build/
 
 # Vite
 .vite/
+
+# Local SQLite analytics DB (multi-pool feature persistence layer)
+backend/data/
+*.db
+*.db-shm
+*.db-wal

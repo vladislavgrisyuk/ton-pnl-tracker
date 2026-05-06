@@ -121,3 +121,75 @@ class TokenAnalyticsJob(BaseModel):
     progress: TokenAnalyticsProgress
     report: TokenAnalyticsReport | None = None
     error: str | None = None
+
+
+class MultiPoolChildStatus(BaseModel):
+    """Status of one pool inside a multi-pool batch."""
+
+    pool: str = Field(description="raw pool address as accepted")
+    token_address: str | None = None
+    progress: TokenAnalyticsProgress
+    report: TokenAnalyticsReport | None = None
+    error: str | None = None
+    persisted_rows: int = 0
+
+
+class MultiPoolJob(BaseModel):
+    """Top-level batch job that fans out N pools in parallel."""
+
+    job_id: str
+    status: Literal["queued", "running", "completed", "failed", "partial"] = "queued"
+    started_at: int | None = None
+    finished_at: int | None = None
+    children: list[MultiPoolChildStatus] = []
+    error: str | None = None
+    total_persisted_rows: int = 0
+
+
+class WalletTokenStatRow(BaseModel):
+    """API model for ``wallet_token_stats`` rows (mirrors the SQLite schema)."""
+
+    wallet: str
+    token_master: str
+    pool_address: str
+    token_symbol: str | None = None
+    token_name: str | None = None
+    token_decimals: int | None = None
+    token_image: str | None = None
+    total_bought: float
+    total_sold: float
+    estimated_balance: float
+    buy_volume_usd: float
+    sell_volume_usd: float
+    avg_buy_price_usd: float | None = None
+    current_price_usd: float | None = None
+    current_value_usd: float
+    realized_pnl_usd: float
+    unrealized_pnl_usd: float
+    total_pnl_usd: float
+    trade_count: int
+    first_trade_ts: int | None = None
+    last_trade_ts: int | None = None
+    only_sells: bool
+    sold_more_than_bought: bool
+    updated_at: int
+
+
+class TokenSummaryRow(BaseModel):
+    """One row per analyzed token (used by the DB browser sidebar)."""
+
+    token_master: str
+    token_symbol: str | None = None
+    token_name: str | None = None
+    token_image: str | None = None
+    token_decimals: int | None = None
+    wallet_count: int
+    total_buy_usd: float
+    total_sell_usd: float
+    last_updated: int | None = None
+
+
+class WalletTokenStatsResponse(BaseModel):
+    rows: list[WalletTokenStatRow]
+    tokens: list[TokenSummaryRow]
+    db_stats: dict[str, int | None]

@@ -22,20 +22,26 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 from .address import friendly_to_raw
+from .analytics_db import get_analytics_db
 from .geckoterminal import GeckoTerminalClient
 from .models import (
     TON_ASSET_ID,
+    MultiPoolJob,
     PnLReport,
     Swap,
     TokenAnalyticsJob,
     TokenAnalyticsProgress,
     TokenInfo,
+    TokenSummaryRow,
+    WalletTokenStatRow,
+    WalletTokenStatsResponse,
 )
+from .multi_pool import MultiPoolJobRunner, parse_pool_lines
 from .pnl import compute_pnl
 from .pricing import PriceService, annotate_usd_values
 from .settings import settings
 from .swaps import TON_DECIMALS, extract_swaps
-from .token_analytics import analyze_pool_traders
+from .token_analytics import analyze_pool_traders, to_raw_address
 from .tonapi import TonApiClient, TonApiError
 
 log = logging.getLogger(__name__)
@@ -44,6 +50,7 @@ log = logging.getLogger(__name__)
 # refresh quickly without hammering the upstream APIs.
 _CACHE: dict[str, tuple[float, PnLReport]] = {}
 _TOKEN_ANALYTICS_JOBS: dict[str, TokenAnalyticsJob] = {}
+_MULTI_POOL_JOBS: dict[str, MultiPoolJob] = {}
 
 
 @asynccontextmanager
@@ -115,6 +122,17 @@ async def _run_token_analytics_job(
                 page_size=batch_size,
                 progress=update_progress,
             )
+        # Persist trader rows so the multi-pool DB browser can query across
+        # all analyses run from this server, regardless of single vs batch.
+        try:
+            db = get_analytics_db()
+            await db.upsert_trader_rows(
+                report.rows,
+                pool_address=to_raw_address(pool_address),
+            )
+        except Exception as exc:  # noqa: BLE001 - persistence is best-effort
+            log.exception("token analytics persistence failed")
+            report.warnings.append(f"DB persistence failed: {exc}")
         job.report = report
         job.progress = TokenAnalyticsProgress(
             status="completed",
@@ -339,3 +357,141 @@ async def get_token_analytics_job(job_id: str) -> TokenAnalyticsJob:
     if job is None:
         raise HTTPException(status_code=404, detail="job not found")
     return job
+
+
+class MultiPoolJobRequest(BaseModel):
+    """Request body for ``POST /api/multi-pool-analytics/jobs``.
+
+    Either ``pools`` (a list) or ``raw`` (free-form textarea content) is
+    accepted; the runner deduplicates by ``(pool, token)`` key. ``raw`` is
+    convenient for the frontend, which posts the textarea contents verbatim.
+    """
+
+    pools: list[str] | None = None
+    raw: str | None = None
+    limit: int | None = None
+    rps: float | None = None
+    batch_size: int | None = None
+    max_concurrency: int | None = None
+
+
+@app.post("/api/multi-pool-analytics/jobs", response_model=MultiPoolJob)
+async def start_multi_pool_job(req: MultiPoolJobRequest) -> MultiPoolJob:
+    raw_lines: list[str] = []
+    if req.pools:
+        raw_lines.extend(req.pools)
+    if req.raw:
+        raw_lines.append(req.raw)
+    if not raw_lines:
+        raise HTTPException(status_code=400, detail="no pools provided")
+    parsed = parse_pool_lines("\n".join(raw_lines))
+    if not parsed:
+        raise HTTPException(status_code=400, detail="no valid pool addresses parsed")
+    if len(parsed) > 50:
+        raise HTTPException(status_code=400, detail="too many pools (max 50 per batch)")
+    for pool, _token in parsed:
+        try:
+            _to_raw_address(pool)
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=400,
+                detail=f"invalid pool address: {pool}",
+            ) from exc
+
+    effective_rps = req.rps if req.rps is not None else settings.tonapi_rps
+    effective_batch = req.batch_size if req.batch_size is not None else 100
+    effective_limit = req.limit if req.limit is not None else settings.max_events_per_wallet
+    effective_concurrency = (
+        req.max_concurrency
+        if req.max_concurrency is not None
+        else settings.multi_pool_max_concurrency
+    )
+    if effective_rps <= 0:
+        raise HTTPException(status_code=400, detail="rps must be greater than 0")
+    if effective_batch < 1 or effective_batch > 100:
+        raise HTTPException(status_code=400, detail="batch_size must be between 1 and 100")
+    if effective_limit < 1:
+        raise HTTPException(status_code=400, detail="limit must be greater than 0")
+    if effective_concurrency < 1:
+        raise HTTPException(status_code=400, detail="max_concurrency must be >= 1")
+
+    runner = MultiPoolJobRunner(
+        pools=parsed,
+        limit=effective_limit,
+        rps=effective_rps,
+        batch_size=effective_batch,
+        max_concurrency=effective_concurrency,
+    )
+    _MULTI_POOL_JOBS[runner.job_id] = runner.job
+    asyncio.create_task(runner.run())
+    return runner.job
+
+
+@app.get("/api/multi-pool-analytics/jobs/{job_id}", response_model=MultiPoolJob)
+async def get_multi_pool_job(job_id: str) -> MultiPoolJob:
+    job = _MULTI_POOL_JOBS.get(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="job not found")
+    return job
+
+
+@app.get("/api/wallet-token-stats", response_model=WalletTokenStatsResponse)
+async def list_wallet_token_stats(
+    token_master: str | None = None,
+    wallet: str | None = None,
+    min_total_pnl_usd: float | None = None,
+    max_total_pnl_usd: float | None = None,
+    only_with_balance: bool = False,
+    sort: str = "total_pnl_desc",
+    limit: int = 200,
+    offset: int = 0,
+) -> WalletTokenStatsResponse:
+    db = get_analytics_db()
+    normalized_token = None
+    if token_master:
+        try:
+            normalized_token = _to_raw_address(token_master.strip())
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail="invalid token address") from exc
+    normalized_wallet = None
+    if wallet:
+        try:
+            normalized_wallet = _to_raw_address(wallet.strip())
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail="invalid wallet address") from exc
+
+    rows = await db.query(
+        token_master=normalized_token,
+        wallet=normalized_wallet,
+        min_total_pnl_usd=min_total_pnl_usd,
+        max_total_pnl_usd=max_total_pnl_usd,
+        only_with_balance=only_with_balance,
+        sort=sort,
+        limit=limit,
+        offset=offset,
+    )
+    tokens_raw = await db.list_tokens()
+    db_stats = await db.stats()
+    return WalletTokenStatsResponse(
+        rows=[WalletTokenStatRow(**vars(r)) for r in rows],
+        tokens=[
+            TokenSummaryRow(
+                token_master=t["token_master"],
+                token_symbol=t.get("token_symbol"),
+                token_name=t.get("token_name"),
+                token_image=t.get("token_image"),
+                token_decimals=t.get("token_decimals"),
+                wallet_count=int(t.get("wallet_count") or 0),
+                total_buy_usd=float(t.get("total_buy_usd") or 0.0),
+                total_sell_usd=float(t.get("total_sell_usd") or 0.0),
+                last_updated=t.get("last_updated"),
+            )
+            for t in tokens_raw
+        ],
+        db_stats={
+            "row_count": db_stats.get("row_count"),
+            "wallet_count": db_stats.get("wallet_count"),
+            "token_count": db_stats.get("token_count"),
+            "last_updated": db_stats.get("last_updated"),
+        },
+    )

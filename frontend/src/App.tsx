@@ -7,6 +7,8 @@ import {
   type PnLReport,
   type TokenAnalyticsJob,
 } from "./api";
+import { DbBrowserPanel } from "./components/DbBrowserPanel";
+import { MultiPoolPanel } from "./components/MultiPoolPanel";
 import { SummaryCards } from "./components/SummaryCards";
 import { SwapTable } from "./components/SwapTable";
 import { TokenTable } from "./components/TokenTable";
@@ -22,7 +24,7 @@ const DEFAULT_TOKEN_LIMIT = "1000";
 const TOKEN_JOB_POLL_MS = 1000;
 
 type Tab = "tokens" | "swaps";
-type Mode = "wallet" | "token";
+type Mode = "wallet" | "token" | "multi" | "db";
 
 function positiveParam(name: string, fallback: string) {
   const value = new URL(window.location.href).searchParams.get(name);
@@ -39,8 +41,14 @@ function positiveNumber(value: string, fallback: string) {
 
 export default function App() {
   const initialUrl = new URL(window.location.href);
-  const initialMode: Mode = initialUrl.searchParams.get("pool") ? "token" : "wallet";
+  const tabParam = initialUrl.searchParams.get("tab");
+  const initialMode: Mode = ((): Mode => {
+    if (tabParam === "multi" || tabParam === "db") return tabParam;
+    if (initialUrl.searchParams.get("pool")) return "token";
+    return "wallet";
+  })();
   const [mode, setMode] = useState<Mode>(initialMode);
+  const [dbRefreshKey, setDbRefreshKey] = useState(0);
   const [address, setAddress] = useState(() => initialUrl.searchParams.get("wallet") ?? "");
   const [poolAddress, setPoolAddress] = useState(
     () => initialUrl.searchParams.get("pool") ?? "",
@@ -200,6 +208,17 @@ export default function App() {
     void runTokenAnalytics(poolAddress, tokenFilter);
   }
 
+  function switchMode(next: Mode) {
+    setMode(next);
+    const url = new URL(window.location.href);
+    if (next === "multi" || next === "db") {
+      url.searchParams.set("tab", next);
+    } else {
+      url.searchParams.delete("tab");
+    }
+    window.history.replaceState(null, "", url.toString());
+  }
+
   return (
     <div className="app">
       <header className="app__header">
@@ -215,16 +234,30 @@ export default function App() {
         <button
           type="button"
           className={mode === "wallet" ? "mode-tab mode-tab--active" : "mode-tab"}
-          onClick={() => setMode("wallet")}
+          onClick={() => switchMode("wallet")}
         >
           Wallet PnL
         </button>
         <button
           type="button"
           className={mode === "token" ? "mode-tab mode-tab--active" : "mode-tab"}
-          onClick={() => setMode("token")}
+          onClick={() => switchMode("token")}
         >
           Token Analytics
+        </button>
+        <button
+          type="button"
+          className={mode === "multi" ? "mode-tab mode-tab--active" : "mode-tab"}
+          onClick={() => switchMode("multi")}
+        >
+          Multi-pool
+        </button>
+        <button
+          type="button"
+          className={mode === "db" ? "mode-tab mode-tab--active" : "mode-tab"}
+          onClick={() => switchMode("db")}
+        >
+          DB browser
         </button>
       </nav>
 
@@ -492,6 +525,12 @@ export default function App() {
           </p>
         </div>
       )}
+
+      {mode === "multi" && (
+        <MultiPoolPanel onCompleted={() => setDbRefreshKey((k) => k + 1)} />
+      )}
+
+      {mode === "db" && <DbBrowserPanel refreshKey={dbRefreshKey} />}
 
       <footer className="app__footer">
         <p>

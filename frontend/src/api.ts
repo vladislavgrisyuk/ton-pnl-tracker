@@ -185,3 +185,174 @@ export async function fetchTokenAnalyticsJob(
   }
   return (await resp.json()) as TokenAnalyticsJob;
 }
+
+// ---------- Multi-pool batch analytics + DB browser ---------------------
+
+export interface MultiPoolChildStatus {
+  pool: string;
+  token_address?: string | null;
+  progress: TokenAnalyticsProgress;
+  report?: TokenAnalyticsReport | null;
+  error?: string | null;
+  persisted_rows: number;
+}
+
+export interface MultiPoolJob {
+  job_id: string;
+  status: "queued" | "running" | "completed" | "failed" | "partial";
+  started_at?: number | null;
+  finished_at?: number | null;
+  children: MultiPoolChildStatus[];
+  error?: string | null;
+  total_persisted_rows: number;
+}
+
+export interface StartMultiPoolOptions {
+  raw?: string;
+  pools?: string[];
+  limit?: number;
+  rps?: number;
+  batchSize?: number;
+  maxConcurrency?: number;
+  signal?: AbortSignal;
+}
+
+export async function startMultiPoolJob({
+  raw,
+  pools,
+  limit,
+  rps,
+  batchSize,
+  maxConcurrency,
+  signal,
+}: StartMultiPoolOptions): Promise<MultiPoolJob> {
+  const body: Record<string, unknown> = {};
+  if (raw) body.raw = raw;
+  if (pools?.length) body.pools = pools;
+  if (limit && Number.isFinite(limit) && limit > 0) body.limit = limit;
+  if (rps && Number.isFinite(rps) && rps > 0) body.rps = rps;
+  if (batchSize && Number.isFinite(batchSize) && batchSize > 0) body.batch_size = batchSize;
+  if (maxConcurrency && Number.isFinite(maxConcurrency) && maxConcurrency > 0) {
+    body.max_concurrency = maxConcurrency;
+  }
+  const resp = await fetch(`${API_BASE}/api/multi-pool-analytics/jobs`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+    signal,
+  });
+  if (!resp.ok) {
+    throw new Error(await parseError(resp));
+  }
+  return (await resp.json()) as MultiPoolJob;
+}
+
+export async function fetchMultiPoolJob(
+  jobId: string,
+  signal?: AbortSignal,
+): Promise<MultiPoolJob> {
+  const resp = await fetch(
+    `${API_BASE}/api/multi-pool-analytics/jobs/${encodeURIComponent(jobId)}`,
+    { signal },
+  );
+  if (!resp.ok) {
+    throw new Error(await parseError(resp));
+  }
+  return (await resp.json()) as MultiPoolJob;
+}
+
+export interface WalletTokenStatRow {
+  wallet: string;
+  token_master: string;
+  pool_address: string;
+  token_symbol: string | null;
+  token_name: string | null;
+  token_decimals: number | null;
+  token_image: string | null;
+  total_bought: number;
+  total_sold: number;
+  estimated_balance: number;
+  buy_volume_usd: number;
+  sell_volume_usd: number;
+  avg_buy_price_usd: number | null;
+  current_price_usd: number | null;
+  current_value_usd: number;
+  realized_pnl_usd: number;
+  unrealized_pnl_usd: number;
+  total_pnl_usd: number;
+  trade_count: number;
+  first_trade_ts: number | null;
+  last_trade_ts: number | null;
+  only_sells: boolean;
+  sold_more_than_bought: boolean;
+  updated_at: number;
+}
+
+export interface TokenSummaryRow {
+  token_master: string;
+  token_symbol: string | null;
+  token_name: string | null;
+  token_image: string | null;
+  token_decimals: number | null;
+  wallet_count: number;
+  total_buy_usd: number;
+  total_sell_usd: number;
+  last_updated: number | null;
+}
+
+export interface WalletTokenStatsResponse {
+  rows: WalletTokenStatRow[];
+  tokens: TokenSummaryRow[];
+  db_stats: {
+    row_count: number | null;
+    wallet_count: number | null;
+    token_count: number | null;
+    last_updated: number | null;
+  };
+}
+
+export interface QueryWalletTokenStatsOptions {
+  tokenMaster?: string;
+  wallet?: string;
+  minTotalPnlUsd?: number;
+  maxTotalPnlUsd?: number;
+  onlyWithBalance?: boolean;
+  sort?: string;
+  limit?: number;
+  offset?: number;
+  signal?: AbortSignal;
+}
+
+export async function queryWalletTokenStats({
+  tokenMaster,
+  wallet,
+  minTotalPnlUsd,
+  maxTotalPnlUsd,
+  onlyWithBalance,
+  sort,
+  limit,
+  offset,
+  signal,
+}: QueryWalletTokenStatsOptions = {}): Promise<WalletTokenStatsResponse> {
+  const params = new URLSearchParams();
+  if (tokenMaster?.trim()) params.set("token_master", tokenMaster.trim());
+  if (wallet?.trim()) params.set("wallet", wallet.trim());
+  if (minTotalPnlUsd !== undefined && Number.isFinite(minTotalPnlUsd)) {
+    params.set("min_total_pnl_usd", String(minTotalPnlUsd));
+  }
+  if (maxTotalPnlUsd !== undefined && Number.isFinite(maxTotalPnlUsd)) {
+    params.set("max_total_pnl_usd", String(maxTotalPnlUsd));
+  }
+  if (onlyWithBalance) params.set("only_with_balance", "true");
+  if (sort) params.set("sort", sort);
+  if (limit && limit > 0) params.set("limit", String(limit));
+  if (offset && offset > 0) params.set("offset", String(offset));
+  const qs = params.toString();
+  const resp = await fetch(`${API_BASE}/api/wallet-token-stats${qs ? `?${qs}` : ""}`, {
+    signal,
+  });
+  if (!resp.ok) {
+    throw new Error(await parseError(resp));
+  }
+  return (await resp.json()) as WalletTokenStatsResponse;
+}

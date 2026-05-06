@@ -71,6 +71,14 @@ class Settings(BaseSettings):
         "http://127.0.0.1:5173",
     ]
 
+    # Path to the SQLite analytics DB. ``None`` -> default location under
+    # ``backend/data/analytics.db`` (see ``analytics_db.DEFAULT_DB_PATH``).
+    analytics_db_path: str | None = None
+    # Hard cap on parallel pool jobs in a multi-pool batch. tonviewer's frontend
+    # proxy can sustain ~30 RPS; combined with our per-job RPS that gives a
+    # comfortable concurrency floor of ~10 with rps=3 each.
+    multi_pool_max_concurrency: int = 10
+
     @field_validator("tonapi_headers", "tonapi_cookies", mode="before")
     @classmethod
     def _decode_kv(cls, value: str | dict[str, str] | None) -> dict[str, str]:
